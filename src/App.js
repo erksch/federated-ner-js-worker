@@ -10,7 +10,7 @@ const App = () => {
   const [log, setLog] = useState([]);
   const [gridUrl, setGridUrl] = useState('ws://localhost:5000');
   const [modelName, setModelName] = useState('conll');
-  const [modelVersion, setModelVersion] = useState('1.0.21');
+  const [modelVersion, setModelVersion] = useState('1.0.22');
   const [config, setClientConfig] = useState({});
   const [accuracies, setAccuracies] = useState([]);
   const [losses, setLosses] = useState([]);
@@ -52,7 +52,7 @@ const App = () => {
 
       // Prepare train parameters.
       const batchSize = 200; //clientConfig.batch_size;
-      const lr = clientConfig.lr;
+      const lr = 0.001; //clientConfig.lr;
       const numBatches = Math.ceil(X.shape[0] / batchSize);
 
       // Calculate total number of model updates
@@ -88,7 +88,15 @@ const App = () => {
         // Execute the plan and get updated model params back.
         let [loss, acc, ...updatedModelParams] = await job.plans[
           'training_plan'
-        ].execute(job.worker, X_batch, y_batch, chunkSize, lr, ...modelParams);
+        ].execute(
+          job.worker,
+          X_batch,
+          y_batch,
+          chunkSize,
+          lr,
+          tf.tensor1d([1, 0.3, 1, 1, 1]),
+          ...modelParams,
+        );
 
         // Use updated model params in the next cycle.
         for (let i = 0; i < modelParams.length; i++) {
@@ -157,10 +165,11 @@ const App = () => {
               ),
             );
 
+            updateLog(receivedIdx2Label[label]);
             updateLog(
-              `${receivedIdx2Label[label]}: ${tp} / ${num_total} | F1 ${f1Score.toFixed(
+              `TP ${tp} FP ${fp} FN ${fn} / ${num_total} F1 ${f1Score.toFixed(
                 2,
-              )} R ${recall.toFixed(2)} P ${precision.toFixed(2)} `,
+              )} R ${recall.toFixed(2)} P ${precision.toFixed(2)}`,
             );
           });
         }
