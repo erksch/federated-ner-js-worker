@@ -10,7 +10,7 @@ const App = () => {
   const [log, setLog] = useState([]);
   const [gridUrl, setGridUrl] = useState('ws://localhost:5000');
   const [modelName, setModelName] = useState('conll');
-  const [modelVersion, setModelVersion] = useState('1.0.22');
+  const [modelVersion, setModelVersion] = useState('1.0.26');
   const [config, setClientConfig] = useState({});
   const [accuracies, setAccuracies] = useState([]);
   const [losses, setLosses] = useState([]);
@@ -51,16 +51,14 @@ const App = () => {
       tf.util.shuffle(indices);
 
       // Prepare train parameters.
-      const batchSize = 200; //clientConfig.batch_size;
+      const batchSize = 10000; //clientConfig.batch_size;
       const lr = 0.001; //clientConfig.lr;
       const numBatches = Math.ceil(X.shape[0] / batchSize);
 
-      // Calculate total number of model updates
-      // in case none of these options specified, we fallback to one loop
-      // though all batches.
-      const maxEpochs = clientConfig.max_epochs || 1;
-      const maxUpdates = clientConfig.max_updates || maxEpochs * numBatches;
-      const numUpdates = maxEpochs * numBatches; // Math.min(maxUpdates, maxEpochs * numBatches);
+      updateLog(`Learning rate ${lr}`);
+      updateLog(`${numBatches} batches of size ${batchSize}`);
+
+      const epochs = 50;
 
       // Copy model to train it.
       let modelParams = [];
@@ -71,64 +69,70 @@ const App = () => {
       updateLog('Starting training...');
 
       // Main training loop.
-      for (
-        let update = 0, batch = 0, epoch = 0;
-        update < numUpdates;
-        update++
-      ) {
-        // Slice a batch.
-        const chunkSize = Math.min(batchSize, X.shape[0] - batch * batchSize);
-        const indicesBatch = indices.slice(
-          batch * batchSize,
-          batch * batchSize + chunkSize,
-        );
-        const X_batch = X.gather(indicesBatch);
-        const y_batch = y.gather(indicesBatch);
+      for (let epoch = 0; epoch < epochs; epoch++) {
+        updateLog(`Epoch ${epoch + 1}`);
+        for (let batch = 0; batch < numBatches; batch++) {
+          // Slice a batch.
+          const chunkSize = Math.min(batchSize, X.shape[0] - batch * batchSize);
+          if (chunkSize < batchSize) continue;
+          const indicesBatch = indices.slice(
+            batch * batchSize,
+            batch * batchSize + chunkSize,
+          );
+          const X_batch = X.gather(indicesBatch);
+          const y_batch = y.gather(indicesBatch);
 
-        // Execute the plan and get updated model params back.
-        let [loss, acc, ...updatedModelParams] = await job.plans[
-          'training_plan'
-        ].execute(
-          job.worker,
-          X_batch,
-          y_batch,
-          chunkSize,
-          lr,
-          tf.tensor1d([1, 0.3, 1, 1, 1]),
-          ...modelParams,
-        );
-
-        // Use updated model params in the next cycle.
-        for (let i = 0; i < modelParams.length; i++) {
-          modelParams[i].dispose();
-          modelParams[i] = updatedModelParams[i];
-        }
-
-        const lossValue = await loss.array();
-        const accuracyValue = await acc.array();
-
-        setLosses((losses) => [...losses, lossValue]);
-        setAccuracies((accuracies) => [...accuracies, accuracyValue]);
-
-        updateLog(
-          `E ${epoch} | B ${batch} / ${numBatches} | L ${lossValue.toFixed(
-            2,
-          )} | A ${accuracyValue.toFixed(2)}`,
-        );
-
-        batch++;
-
-        if (batch % 50 === 0) {
-          updateLog('Running evaluation.');
-
-          let [prediction, groundTruth] = await job.plans['eval_plan'].execute(
+          // Execute the plan and get updated model params back.
+          let [loss, acc, ...updatedModelParams] = await job.plans[
+            'training_plan'
+          ].execute(
             job.worker,
-            X,
-            y,
+            X_batch,
+            y_batch,
+            chunkSize,
+            lr,
+            tf.tensor1d([0.96, 0.17, 0.98, 0.95, 0.96]),
             ...modelParams,
           );
 
-          _.range(y.shape[1]).forEach(async (label) => {
+          // Use updated model params in the next cycle.
+          for (let i = 0; i < modelParams.length; i++) {
+            modelParams[i].dispose();
+            modelParams[i] = updatedModelParams[i];
+          }
+
+          const lossValue = await loss.array();
+          const accuracyValue = await acc.array();
+
+          setLosses((losses) => [...losses, lossValue]);
+          setAccuracies((accuracies) => [...accuracies, accuracyValue]);
+
+          // Free GPU memory.
+          acc.dispose();
+          loss.dispose();
+          X_batch.dispose();
+          y_batch.dispose();
+
+          updateLog(
+            `E ${
+              epoch + 1
+            } | B ${batch} / ${numBatches} | L ${lossValue.toFixed(
+              2,
+            )} | A ${accuracyValue.toFixed(2)}`,
+          );
+        }
+
+        updateLog('Running evaluation...');
+
+        let [prediction, groundTruth] = await job.plans['eval_plan'].execute(
+          job.worker,
+          X,
+          y,
+          ...modelParams,
+        );
+
+        await Promise.all(
+          _.range(y.shape[1]).map(async (label) => {
             const indices_in_class = (
               await tf.whereAsync(groundTruth.equal(label))
             ).squeeze();
@@ -139,7 +143,7 @@ const App = () => {
                     .gather(indices_in_class)
                     .equal(prediction.gather(indices_in_class))
                     .sum()
-                    .dataSync()
+                    .dataSync()[0]
                 : 0;
             const fn = num_total - tp;
             const recall = num_total > 0 ? tp / num_total : 0;
@@ -153,7 +157,7 @@ const App = () => {
                     .gather(indices_predicted_in_class)
                     .notEqual(prediction.gather(indices_predicted_in_class))
                     .sum()
-                    .dataSync()
+                    .dataSync()[0]
                 : 0;
 
             const precision = tp + fp > 0 ? tp / (tp + fp) : 0;
@@ -165,28 +169,18 @@ const App = () => {
               ),
             );
 
-            updateLog(receivedIdx2Label[label]);
+            updateLog(`${receivedIdx2Label[label]} (${num_total}) -------`);
+            updateLog(`TP ${tp} FP ${fp} FN ${fn}`);
             updateLog(
-              `TP ${tp} FP ${fp} FN ${fn} / ${num_total} F1 ${f1Score.toFixed(
+              `F1 ${f1Score.toFixed(2)} R ${recall.toFixed(
                 2,
-              )} R ${recall.toFixed(2)} P ${precision.toFixed(2)}`,
+              )} P ${precision.toFixed(2)}`,
             );
-          });
-        }
-
-        // Check if we're out of batches (end of epoch).
-        if (batch === numBatches) {
-          batch = 0;
-
-          epoch++;
-        }
-
-        // Free GPU memory.
-        acc.dispose();
-        loss.dispose();
-        X_batch.dispose();
-        y_batch.dispose();
+            updateLog(' ');
+          }),
+        );
       }
+
       updateLog('Training done.');
 
       // Free GPU memory.
