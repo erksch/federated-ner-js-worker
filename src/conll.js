@@ -18,9 +18,43 @@
 import _ from 'lodash';
 import * as tf from '@tensorflow/tfjs-core';
 
+export const idx2Label = ['O', 'MISC', 'ORG', 'PER', 'LOC'];
+export const label2Idx = { O: 0, MISC: 1, ORG: 2, PER: 3, LOC: 4 };
+const embeddingsDim = 100;
+
 export class ConLLData {
-  async load() {
-    const dataResponse = await fetch('http://localhost:8000/eng.train.txt');
+  async loadEmbeddings() {
+    const embeddingsResponse = await fetch(
+      `http://localhost:8000/glove.6B.${embeddingsDim}d.txt`,
+    );
+    const embeddingsText = await embeddingsResponse.text();
+    const embeddings = {};
+
+    console.log('Creating embedding dictionary...');
+
+    embeddingsText.split('\n').forEach((line) => {
+      if (line.length === 0) return;
+      let [token, ...embedding] = line.split(' ');
+      embedding = embedding.map((num) => Number(num));
+      embeddings[token.toLowerCase()] = embedding;
+    });
+
+    embeddings['UNKNOWN_TOKEN'] = _.times(embeddingsDim, _.constant(0));
+
+    this.embeddings = embeddings;
+  }
+
+  async loadTrainDataset() {
+    return await this.loadDataset('http://localhost:8000/eng.train.txt');
+  }
+
+  async loadTestDataset() {
+    return await this.loadDataset('http://localhost:8000/eng.testa.txt');
+  }
+
+  async loadDataset(url) {
+    console.log(`Loading dataset from ${url}.`);
+    const dataResponse = await fetch(url);
     const text = await dataResponse.text();
 
     let sentences = [[]];
@@ -39,107 +73,43 @@ export class ConLLData {
       ]);
     });
     sentences = sentences.filter((sentence) => sentence.length > 0);
-
-    const words = new Set();
-    const labels = new Set();
-
-    console.log('Extracting words and labels...');
-    sentences.forEach((sentence) =>
-      sentence.forEach(([token, label]) => {
-        labels.add(label);
-        words.add(token.toLowerCase());
-      }),
+    sentences = sentences.map((sentence) =>
+      sentence.filter(([token, label]) => label !== 'O'),
     );
-    console.log(`Extracted ${words.size} words and ${labels.size} labels.`);
-    console.log(labels);
-    /*
-    const word2Idx = {};
-    word2Idx['PADDING_TOKEN'] = 0;
-    word2Idx['UNKNOWN_TOKEN'] = 1;
-
-    words.forEach((word) => {
-      word2Idx[word] = Object.keys(word2Idx).length;
-    });
-
-    const idx2Word = {};
-    Object.keys(idx2Word).forEach((word) => {
-      idx2Word[idx2Word[word]] = word;
-    });
-    */
-
-    const label2Idx = {};
-    labels.forEach((label) => {
-      label2Idx[label] = Object.keys(label2Idx).length;
-    });
-
-    const idx2Label = {};
-    Object.keys(label2Idx).forEach((label) => {
-      idx2Label[label2Idx[label]] = label;
-    });
-
-    /*
-    const data = sentences.map((sentence) =>
-      sentence.map(([token, label]) => [
-        word2Idx[token.toLowerCase()] || word2Idx['UNKNOWN_TOKEN'],
-        label2Idx[label],
-      ]),
-    );
-    */
-    const embeddingsResponse = await fetch(
-      'http://localhost:8000/glove.6B.50d.txt',
-    );
-    const embeddingsText = await embeddingsResponse.text();
-    const embeddings = {};
-    embeddings['UNKNOWN_TOKEN'] = _.times(50, _.constant(0));
-    embeddingsText.split('\n').forEach((line) => {
-      let [token, ...embedding] = line.split(' ');
-      embedding = embedding.map((num) => Number(num));
-      embeddings[token.toLowerCase()] = embedding;
-    });
-
-    /*
-    const data = sentences.map((sentence) => {
-      const tokens = sentence.map((arr) => arr[0].toLowerCase());
-      const labels = sentence.map((arr) => arr[0]);
-
-      return [
-        tf.tensor2d(
-          tokens.map((token) =>
-            token in embeddings
-              ? embeddings[token]
-              : embeddings['UNKNOWN_TOKEN'],
-          ),
-          [tokens.length, 50],
-        ),
-        tf.tensor1d(labels.map((label) => label2Idx[label])),
-      ];
-    });
-    */
 
     const flatTokens = sentences
       .map((sentence) => sentence.map((arr) => arr[0].toLowerCase()))
       .flat();
+      
     const flatLabels = sentences
       .map((sentence) => sentence.map((arr) => label2Idx[arr[1]]))
       .flat();
+      
     const flatLabelsOneHot = flatLabels.map((label) => {
       const oneHot = _.times(5, _.constant(0));
       oneHot[label] = 1;
       return oneHot;
     });
+    
+    let count = 0;
+
+    console.log('Building tensors...');
 
     const X = tf.tensor2d(
-      flatTokens.map((token) =>
-        token in embeddings ? embeddings[token] : embeddings['UNKNOWN_TOKEN'],
-      ),
-      [flatTokens.length, 50],
+      flatTokens.map((token) => {
+        if (token in this.embeddings) {
+          count++;
+          return this.embeddings[token];
+        }
+        return this.embeddings['UNKNOWN_TOKEN'];
+      }),
+      [flatTokens.length, embeddingsDim],
+    );
+    console.log(
+      `Found embeddings for ${count} of ${flatTokens.length} tokens.`,
     );
     const y = tf.tensor2d(flatLabelsOneHot, [flatTokens.length, 5]);
 
-    return { X, y, label2Idx, idx2Label };
+    return [X, y];
   }
-
-  getTrainData() {}
-
-  getTestData(numExamples) {}
 }

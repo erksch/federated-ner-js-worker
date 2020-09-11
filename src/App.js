@@ -3,19 +3,20 @@ import _ from 'lodash';
 import * as tf from '@tensorflow/tfjs-core';
 import { Syft } from '@openmined/syft.js';
 import Plot from 'react-plotly.js';
-import { ConLLData } from './conll';
+import { ConLLData, idx2Label, label2Idx } from './conll';
 import './App.css';
 
 const App = () => {
   const [log, setLog] = useState([]);
   const [gridUrl, setGridUrl] = useState('ws://localhost:5000');
-  const [modelName, setModelName] = useState('conll');
-  const [modelVersion, setModelVersion] = useState('1.0.26');
+  const [modelName, setModelName] = useState('conll-100d');
+  const [modelVersion, setModelVersion] = useState('1.0.0');
   const [config, setClientConfig] = useState({});
   const [accuracies, setAccuracies] = useState([]);
   const [losses, setLosses] = useState([]);
-  const [f1Scores, setF1Scores] = useState(_.times(5, () => []));
-  const [idx2Label, setIdx2Label] = useState({});
+  const [f1Scores, setF1Scores] = useState(
+    _.times(5, () => ({ train: [], test: [] })),
+  );
 
   const updateLog = (text) => setLog((log) => [...log, text]);
 
@@ -31,98 +32,8 @@ const App = () => {
       updateLog('Accepted');
       setClientConfig(clientConfig);
 
-      updateLog('Loading ConLL data...');
-
-      let X, y, receivedIdx2Label;
-
-      try {
-        ({ X, y, idx2Label: receivedIdx2Label } = await new ConLLData().load());
-        setIdx2Label(receivedIdx2Label);
-        updateLog('ConLL data loaded.');
-      } catch (error) {
-        updateLog(`Error: ${error.message}`);
-        return;
-      }
-
-      updateLog(`data shape ${X.shape} | label shape ${y.shape}`);
-
-      // Prepare randomized indices for data batching.
-      const indices = Array.from({ length: X.shape[0] }, (v, i) => i);
-      tf.util.shuffle(indices);
-
-      // Prepare train parameters.
-      const batchSize = 10000; //clientConfig.batch_size;
-      const lr = 0.001; //clientConfig.lr;
-      const numBatches = Math.ceil(X.shape[0] / batchSize);
-
-      updateLog(`Learning rate ${lr}`);
-      updateLog(`${numBatches} batches of size ${batchSize}`);
-
-      const epochs = 50;
-
-      // Copy model to train it.
-      let modelParams = [];
-      for (let param of model.params) {
-        modelParams.push(param.clone());
-      }
-
-      updateLog('Starting training...');
-
-      // Main training loop.
-      for (let epoch = 0; epoch < epochs; epoch++) {
-        updateLog(`Epoch ${epoch + 1}`);
-        for (let batch = 0; batch < numBatches; batch++) {
-          // Slice a batch.
-          const chunkSize = Math.min(batchSize, X.shape[0] - batch * batchSize);
-          if (chunkSize < batchSize) continue;
-          const indicesBatch = indices.slice(
-            batch * batchSize,
-            batch * batchSize + chunkSize,
-          );
-          const X_batch = X.gather(indicesBatch);
-          const y_batch = y.gather(indicesBatch);
-
-          // Execute the plan and get updated model params back.
-          let [loss, acc, ...updatedModelParams] = await job.plans[
-            'training_plan'
-          ].execute(
-            job.worker,
-            X_batch,
-            y_batch,
-            chunkSize,
-            lr,
-            tf.tensor1d([0.96, 0.17, 0.98, 0.95, 0.96]),
-            ...modelParams,
-          );
-
-          // Use updated model params in the next cycle.
-          for (let i = 0; i < modelParams.length; i++) {
-            modelParams[i].dispose();
-            modelParams[i] = updatedModelParams[i];
-          }
-
-          const lossValue = await loss.array();
-          const accuracyValue = await acc.array();
-
-          setLosses((losses) => [...losses, lossValue]);
-          setAccuracies((accuracies) => [...accuracies, accuracyValue]);
-
-          // Free GPU memory.
-          acc.dispose();
-          loss.dispose();
-          X_batch.dispose();
-          y_batch.dispose();
-
-          updateLog(
-            `E ${
-              epoch + 1
-            } | B ${batch} / ${numBatches} | L ${lossValue.toFixed(
-              2,
-            )} | A ${accuracyValue.toFixed(2)}`,
-          );
-        }
-
-        updateLog('Running evaluation...');
+      async function evaluate(type, X, y) {
+        updateLog(`Running evaluation for ${type}...`);
 
         let [prediction, groundTruth] = await job.plans['eval_plan'].execute(
           job.worker,
@@ -163,13 +74,15 @@ const App = () => {
             const precision = tp + fp > 0 ? tp / (tp + fp) : 0;
             const f1Score = (2 * tp) / (2 * tp + fp + fn);
 
-            setF1Scores((labels) =>
-              labels.map((scores, index) =>
-                index === label ? [...scores, f1Score] : scores,
+            setF1Scores((scores) =>
+              scores.map((scores, index) =>
+                index === label
+                  ? { ...scores, [type]: [...scores[type], f1Score] }
+                  : scores,
               ),
             );
 
-            updateLog(`${receivedIdx2Label[label]} (${num_total}) -------`);
+            updateLog(`${idx2Label[label]} (${num_total}) -------`);
             updateLog(`TP ${tp} FP ${fp} FN ${fn}`);
             updateLog(
               `F1 ${f1Score.toFixed(2)} R ${recall.toFixed(
@@ -181,11 +94,118 @@ const App = () => {
         );
       }
 
+      const conll = new ConLLData();
+
+      updateLog('Loading embeddings...');
+      await conll.loadEmbeddings();
+      updateLog('Done.');
+
+      let X_train, y_train, X_test, y_test;
+
+      try {
+        updateLog('Loading ConLL train data...');
+        [X_train, y_train] = await conll.loadTrainDataset();
+        updateLog('Loading ConLL test data...');
+        [X_test, y_test] = await conll.loadTestDataset();
+        updateLog('ConLL data loaded.');
+      } catch (error) {
+        updateLog(`Error: ${error.message}`);
+        return;
+      }
+
+      updateLog(
+        `Train data shape ${X_train.shape} | label shape ${y_train.shape}`,
+      );
+      updateLog(
+        `Test data shape ${X_test.shape} | label shape ${y_test.shape}`,
+      );
+
+      const epochs = 50;
+      const batchSize = 200;
+      const lr = 0.005;
+      const numBatches = Math.ceil(X_train.shape[0] / batchSize);
+
+      updateLog(`${epochs} epochs`);
+      updateLog(`Learning rate ${lr}`);
+      updateLog(`${numBatches} batches of size ${batchSize}`);
+
+      // Copy model to train it.
+      let modelParams = [];
+      for (let param of model.params) {
+        modelParams.push(param.clone());
+      }
+
+      updateLog('Starting training...');
+
+      for (let epoch = 0; epoch < epochs; epoch++) {
+        evaluate('train', X_train, y_train);
+        evaluate('test', X_test, y_test);
+
+        // Prepare randomized indices for data batching.
+        const indices = Array.from({ length: X_train.shape[0] }, (v, i) => i);
+        tf.util.shuffle(indices);
+
+        updateLog(`Epoch ${epoch + 1}`);
+
+        for (let batch = 0; batch < numBatches; batch++) {
+          // Slice a batch.
+          const chunkSize = Math.min(batchSize, X_train.shape[0] - batch * batchSize);
+          if (chunkSize < batchSize) continue;
+          const indicesBatch = indices.slice(
+            batch * batchSize,
+            batch * batchSize + chunkSize,
+          );
+          const X_batch = X_train.gather(indicesBatch);
+          const y_batch = y_train.gather(indicesBatch);
+
+          // Execute the plan and get updated model params back.
+          let [loss, acc, ...updatedModelParams] = await job.plans[
+            'training_plan'
+          ].execute(
+            job.worker,
+            X_batch,
+            y_batch,
+            chunkSize,
+            lr,
+            tf.tensor1d([1.0, 1.0, 1.0, 1.0, 1.0]),
+            ...modelParams,
+          );
+
+          // Use updated model params in the next cycle.
+          for (let i = 0; i < modelParams.length; i++) {
+            modelParams[i].dispose();
+            modelParams[i] = updatedModelParams[i];
+          }
+
+          const lossValue = await loss.array();
+          const accuracyValue = await acc.array();
+
+          setLosses((losses) => [...losses, lossValue]);
+          setAccuracies((accuracies) => [...accuracies, accuracyValue]);
+
+          // Free GPU memory.
+          acc.dispose();
+          loss.dispose();
+          X_batch.dispose();
+          y_batch.dispose();
+
+          updateLog(
+            `E ${
+              epoch + 1
+            } | B ${batch} / ${numBatches} | L ${lossValue.toFixed(
+              2,
+            )} | A ${accuracyValue.toFixed(2)}`,
+          );
+        }
+      }
+
       updateLog('Training done.');
 
       // Free GPU memory.
-      X.dispose();
-      y.dispose();
+      X_train.dispose();
+      y_train.dispose();
+      X_test.dispose();
+      y_test.dispose();
 
       // Calc model diff.
       updateLog('Creating diff...');
@@ -330,10 +350,24 @@ const App = () => {
             <Plot
               data={[
                 {
-                  x: _.range(scores.length),
-                  y: scores,
+                  x: _.range(scores.test.length),
+                  y: scores.test,
                   type: 'scatter',
                   mode: 'lines',
+                  name: 'test',
+                  line: {
+                    color: 'rgb(255, 0, 0)',
+                  }
+                },
+                {
+                  x: _.range(scores.train.length),
+                  y: scores.train,
+                  type: 'scatter',
+                  mode: 'lines',
+                  name: 'train',
+                  line: {
+                    color: 'rgb(0, 0, 255)',
+                  }
                 },
               ]}
               layout={{
