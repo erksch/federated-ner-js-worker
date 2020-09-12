@@ -3,10 +3,13 @@ import _ from 'lodash';
 import * as tf from '@tensorflow/tfjs-core';
 import { Syft } from '@openmined/syft.js';
 import Plot from 'react-plotly.js';
-import { ConLLData, idx2Label, label2Idx } from './conll';
+import { ConLLData, idx2Label } from './conll';
 import './App.css';
 
+const numParts = 100;
+
 const App = () => {
+  const [splitIndex, setSplitIndex] = useState(0);
   const [log, setLog] = useState([]);
   const [gridUrl, setGridUrl] = useState('ws://localhost:5000');
   const [modelName, setModelName] = useState('conll-100d');
@@ -17,6 +20,23 @@ const App = () => {
   const [f1Scores, setF1Scores] = useState(
     _.times(5, () => ({ train: [], test: [] })),
   );
+
+  const downloadScores = () => {
+    const element = document.createElement('a');
+    const text = JSON.stringify(f1Scores);
+    element.setAttribute(
+      'href',
+      'data:text/plain;charset=utf-8,' + encodeURIComponent(text),
+    );
+    element.setAttribute('download', 'f1_scores.txt');
+
+    element.style.display = 'none';
+    document.body.appendChild(element);
+
+    element.click();
+
+    document.body.removeChild(element);
+  };
 
   const updateLog = (text) => setLog((log) => [...log, text]);
 
@@ -31,6 +51,8 @@ const App = () => {
     job.on('accepted', async ({ model, clientConfig }) => {
       updateLog('Accepted');
       setClientConfig(clientConfig);
+
+      updateLog(`Split Index ${splitIndex} / ${numParts}`)
 
       async function evaluate(type, X, y) {
         updateLog(`Running evaluation for ${type}...`);
@@ -105,6 +127,10 @@ const App = () => {
       try {
         updateLog('Loading ConLL train data...');
         [X_train, y_train] = await conll.loadTrainDataset();
+        const splitSize = Math.floor(X_train.shape[0] / numParts);
+        updateLog(`Slicing train data from size ${X_train.shape[0]} to size ${splitSize}.`)
+        X_train = X_train.slice(splitIndex * splitSize, splitSize);
+        y_train = y_train.slice(splitIndex * splitSize, splitSize);
         updateLog('Loading ConLL test data...');
         [X_test, y_test] = await conll.loadTestDataset();
         updateLog('ConLL data loaded.');
@@ -120,9 +146,9 @@ const App = () => {
         `Test data shape ${X_test.shape} | label shape ${y_test.shape}`,
       );
 
-      const epochs = 50;
-      const batchSize = 200;
-      const lr = 0.005;
+      const epochs = 40;
+      const batchSize = 100;
+      const lr = 0.1;
       const numBatches = Math.ceil(X_train.shape[0] / batchSize);
 
       updateLog(`${epochs} epochs`);
@@ -138,8 +164,8 @@ const App = () => {
       updateLog('Starting training...');
 
       for (let epoch = 0; epoch < epochs; epoch++) {
-        evaluate('train', X_train, y_train);
-        evaluate('test', X_test, y_test);
+        await evaluate('train', X_train, y_train);
+        await evaluate('test', X_test, y_test);
 
         // Prepare randomized indices for data batching.
         const indices = Array.from({ length: X_train.shape[0] }, (v, i) => i);
@@ -149,7 +175,10 @@ const App = () => {
 
         for (let batch = 0; batch < numBatches; batch++) {
           // Slice a batch.
-          const chunkSize = Math.min(batchSize, X_train.shape[0] - batch * batchSize);
+          const chunkSize = Math.min(
+            batchSize,
+            X_train.shape[0] - batch * batchSize,
+          );
           if (chunkSize < batchSize) continue;
           const indicesBatch = indices.slice(
             batch * batchSize,
@@ -251,6 +280,14 @@ const App = () => {
           <div>
             <h2>Setup</h2>
             <p>
+              <label>Split Index</label>
+              <input
+                name="number"
+                value={splitIndex}
+                onChange={(e) => setSplitIndex(Number(e.target.value))}
+              />
+            </p>
+            <p>
               <label>Grid URL</label>
               <input
                 name="text"
@@ -275,6 +312,10 @@ const App = () => {
               />
             </p>
             <button onClick={handleSubmit}>Submit</button>
+          </div>
+          <hr />
+          <div>
+            <button onClick={() => downloadScores()}>Download F1 Scores</button>
           </div>
         </div>
         <div
@@ -357,7 +398,7 @@ const App = () => {
                   name: 'test',
                   line: {
                     color: 'rgb(255, 0, 0)',
-                  }
+                  },
                 },
                 {
                   x: _.range(scores.train.length),
@@ -367,7 +408,7 @@ const App = () => {
                   name: 'train',
                   line: {
                     color: 'rgb(0, 0, 255)',
-                  }
+                  },
                 },
               ]}
               layout={{
